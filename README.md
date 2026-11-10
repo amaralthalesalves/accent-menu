@@ -116,11 +116,11 @@ the popup reads the panel position from KWin (~50 ms, while Tk starts).
 
 ## Windows
 
-Not yet tested on real hardware.
+Tested on Windows 11 (Notepad), Python 3.13.
 
 ### Requirements
 
-Python 3 from python.org (includes Tkinter and the `pythonw` / `.pyw` association).
+Python 3 from python.org or the Microsoft Store (both include Tkinter and `pythonw`).
 
 ### Run
 
@@ -128,10 +128,14 @@ Python 3 from python.org (includes Tkinter and the `pythonw` / `.pyw` associatio
 pythonw accent_menu.py
 ```
 
-Runs in the background with no console window and registers the hotkeys with
-`RegisterHotKey`. If a hotkey is already taken by another app, that letter is
-skipped. Run it once with `python accent_menu.py` (with a console) to see
-which ones failed.
+Runs in the background with no console window. Hotkeys are caught with a
+low-level keyboard hook (`WH_KEYBOARD_LL`), so they win over other apps'
+shortcuts. Only one instance runs at a time. Run it with `python accent_menu.py`
+(with a console) to see errors.
+
+When the hotkey fires, the hook also taps `Ctrl`. Without it the focused app sees
+`Alt` go down and up with no key in between and opens its menu / key tips (Windows 11
+Notepad then swallows the inserted character).
 
 ### Start at login
 
@@ -139,11 +143,11 @@ which ones failed.
 python accent_menu.py --install
 ```
 
-Writes `accent-menu.pyw` into the Startup folder (`shell:startup`, i.e.
-`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`). Don't move the
-script after installing.
+Creates the shortcut `accent-menu.lnk` (pointing to `pythonw.exe`) in the Startup
+folder (`shell:startup`, i.e. `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`).
+Don't move the script after installing.
 
-To uninstall, delete that file and end the `pythonw.exe` process in Task Manager.
+To uninstall, delete that shortcut and end the `pythonw.exe` process in Task Manager.
 
 ### Details
 

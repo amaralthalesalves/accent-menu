@@ -150,10 +150,30 @@ def show_menu(letter, anchor=None):
         x = min(max(ax - pad - tile_w // 2, left), right - width)
         root.geometry(f"+{x}+{y}")
     root.deiconify()
-    root.after(10, root.focus_force)
+    root.after(10, lambda: _force_foreground(root))
     root.after(15000, root.destroy)  # nunca fica preso na tela se não ganhar o foco
     root.mainloop()
     return result
+
+
+def _force_foreground(root):
+    """Traz o menu para frente com foco. No Windows o SetForegroundWindow só funciona para
+    quem recebeu o último input; quem recebeu foi o app em primeiro plano, então nos
+    ligamos à fila de input dele (AttachThreadInput) enquanto pegamos o foco."""
+    if sys.platform == "win32":
+        import ctypes
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        hwnd = user32.GetAncestor(root.winfo_id(), 2)  # GA_ROOT: a janela de nível superior
+        fg_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+        me = kernel32.GetCurrentThreadId()
+        attached = fg_thread != me and user32.AttachThreadInput(me, fg_thread, True)
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(me, fg_thread, False)
+    root.focus_force()
 
 
 def _screen_bounds(root, x, y):
@@ -674,9 +694,10 @@ def _msaa_caret(hwnd):
             hwnd, OBJID_CARET, ctypes.byref(iid_iaccessible), ctypes.byref(acc)) or not acc:
         return None
     # Métodos COM pelo índice na vtable: Release = 2, IAccessible::accLocation = 22.
-    acc_location = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *[ctypes.POINTER(wintypes.LONG)] * 4,
+    # O ponteiro `this` é o 1º argumento da chamada, mas não entra nos argtypes do protótipo.
+    acc_location = ctypes.WINFUNCTYPE(ctypes.c_long, *[ctypes.POINTER(wintypes.LONG)] * 4,
                                       VARIANT)(22, "accLocation")
-    release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(2, "Release")
+    release = ctypes.WINFUNCTYPE(ctypes.c_ulong)(2, "Release")
     x, y, w, h = (wintypes.LONG() for _ in range(4))
     try:
         hr = acc_location(acc, ctypes.byref(x), ctypes.byref(y), ctypes.byref(w), ctypes.byref(h),
@@ -722,35 +743,97 @@ def run_windows():
     # Coordenadas reais de outros processos (MSAA) só batem com as nossas se formos DPI-aware.
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
     ctypes.windll.ole32.CoInitialize(None)  # MSAA precisa de COM para falar com outros processos
-    win_mods = {"alt": 0x1, "ctrl": 0x2, "shift": 0x4, "meta": 0x8}
-    MOD_NOREPEAT, WM_HOTKEY = 0x4000, 0x0312
-    mods = sum(win_mods[m] for m in MODIFIERS) | MOD_NOREPEAT
-    letters = list(ACCENTS)
-    registered = 0
-    for i, letter in enumerate(letters, 1):
-        if user32.RegisterHotKey(None, i, mods, ord(letter.upper())):
-            registered += 1
-        else:
-            print(f"Não foi possível registrar o atalho da letra '{letter}' (já está em uso?)")
-    if not registered:
-        sys.exit("Nenhum atalho registrado (o programa já está rodando?)")
-    msg = wintypes.MSG()
-    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-        if msg.message != WM_HOTKEY:
-            continue
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW(None, False, "accent-menu")
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        sys.exit("O accent-menu já está rodando.")
+
+    import queue
+    pressed = queue.Queue()  # letras cujo atalho foi apertado, para a thread principal
+    threading.Thread(target=_windows_hook, args=(pressed,), daemon=True).start()
+    while True:
+        letter = pressed.get()
         previous = user32.GetForegroundWindow()
-        choice = show_menu(letters[msg.wParam - 1], anchor=_caret_pos_windows(previous))
+        choice = show_menu(letter, anchor=_caret_pos_windows(previous))
         if choice:
             user32.SetForegroundWindow(previous)
             time.sleep(0.05)
             _send_unicode(choice)
 
 
+def _windows_hook(pressed):
+    """Atalhos globais via hook de teclado de baixo nível (WH_KEYBOARD_LL).
+
+    O RegisterHotKey não serve: o app em primeiro plano vê Alt descer e subir sem
+    nenhuma tecla no meio (a letra é engolida) e ativa o menu / as dicas de tecla
+    (o Notepad do Win11 então engole o caractere inserido). O hook vê a letra antes
+    de qualquer app, então injeta ali um toque de Ctrl, que chega ao app garantidamente
+    antes do Alt subir. Teclas sem função (VK 0xE8/0xFF, o truque do AutoHotkey) não
+    desarmam as dicas de tecla do WinUI; Shift desarma, mas Alt+Shift troca o idioma.
+    """
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN, VK_CONTROL = 13, 0x100, 0x104, 0x11
+    mod_keys = {"ctrl": (0x11,), "alt": (0x12,), "shift": (0x10,), "meta": (0x5B, 0x5C)}
+    letters = {ord(letter.upper()): letter for letter in ACCENTS}
+    swallowed = set()  # letras cuja tecla desceu como atalho: engole a repetição e o soltar
+
+    def held(name):
+        return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in mod_keys[name])
+
+    proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    user32.CallNextHookEx.argtypes = (wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    user32.CallNextHookEx.restype = ctypes.c_ssize_t
+    user32.SetWindowsHookExW.argtypes = (ctypes.c_int, proc_type, wintypes.HINSTANCE, wintypes.DWORD)
+    user32.SetWindowsHookExW.restype = wintypes.HHOOK
+
+    @proc_type
+    def proc(code, wparam, lparam):
+        if code == 0:
+            vk = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents.vkCode
+            down = wparam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+            if vk in swallowed:
+                if not down:
+                    swallowed.discard(vk)
+                return 1
+            if down and vk in letters and all(held(m) == (m in MODIFIERS) for m in mod_keys):
+                swallowed.add(vk)
+                # Toque de Ctrl (solta e aperta de novo se estiver pressionado).
+                for flags in ((0x2, 0) if "ctrl" in MODIFIERS else (0, 0x2)):
+                    user32.keybd_event(VK_CONTROL, 0, flags, 0)  # 0x2 = KEYEVENTF_KEYUP
+                pressed.put(letters[vk])
+                return 1
+        return user32.CallNextHookEx(None, code, wparam, lparam)
+
+    if not user32.SetWindowsHookExW(WH_KEYBOARD_LL, proc, None, 0):
+        print("Não foi possível instalar o hook de teclado.")
+        return
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:  # o hook roda dentro deste loop
+        pass
+
+
 def install_windows():
+    # Atalho .lnk direto para o pythonw.exe: o Python da Microsoft Store não associa .pyw.
     startup = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup")
-    path = os.path.join(startup, "accent-menu.pyw")
-    with open(path, "w", encoding="utf-8") as f:  # caminhos com acento (C:\Users\João)
-        f.write(f"import runpy\nrunpy.run_path({SCRIPT!r}, run_name='__main__')\n")
+    old = os.path.join(startup, "accent-menu.pyw")  # versões anteriores
+    if os.path.exists(old):
+        os.remove(old)
+    path = os.path.join(startup, "accent-menu.lnk")
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    quote = lambda s: "'" + s.replace("'", "''") + "'"  # string do PowerShell
+    subprocess.run(["powershell", "-NoProfile", "-Command",
+                    f"$s = (New-Object -ComObject WScript.Shell).CreateShortcut({quote(path)});"
+                    f"$s.TargetPath = {quote(pythonw)};"
+                    f"$s.Arguments = {quote(chr(34) + SCRIPT + chr(34))};"
+                    f"$s.WorkingDirectory = {quote(os.path.dirname(SCRIPT))};"
+                    "$s.Save()"], check=True)
     print(f"Inicialização automática criada: {path}\n"
           f"Para iniciar agora: pythonw \"{SCRIPT}\"")
 
