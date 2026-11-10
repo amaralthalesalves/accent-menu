@@ -62,10 +62,9 @@ def show_menu(letter, anchor=None):
     """
     chars = ACCENTS[letter]
     result = None
-    state = {"sel": 0, "upper": False}
+    state = {"sel": 0, "upper": False, "open": True}
 
-    # O Tk capitaliza a classe: WM_CLASS vira "Accent-menu", que é o que a regra do KWin casa.
-    root = tk.Tk(className="accent-menu")
+    root = _popup_window()
     root.title(f"Acentos: {letter}")
     root.withdraw()  # só aparece depois de posicionado
     root.resizable(False, False)
@@ -110,16 +109,27 @@ def show_menu(letter, anchor=None):
         state["upper"] = upper
         render()
 
+    # Os handlers nunca destroem a janela: só saem do mainloop, e ela é destruída depois,
+    # fora de qualquer evento. Destruir de dentro de um handler (o destroy gera FocusOut,
+    # que destruía de novo) corrompia a memória do Tcl e derrubava o processo no Windows
+    # ("alloc: invalid block").
+    def close():
+        if state["open"]:
+            state["open"] = False
+            root.quit()
+
     def choose(i, upper=None):
         nonlocal result
+        if not state["open"]:
+            return
         upper = state["upper"] if upper is None else upper
         result = chars[i].upper() if upper else chars[i]
-        root.destroy()
+        close()
 
     def on_key(event):
         k = event.keysym
         if k == "Escape":
-            return root.destroy()
+            return close()
         if k in ("Shift_L", "Shift_R"):
             return set_upper(True)
         if k in ("Left", "Right"):
@@ -137,7 +147,7 @@ def show_menu(letter, anchor=None):
     render()
     root.bind("<KeyPress>", on_key)
     root.bind("<KeyRelease>", on_release)
-    root.bind("<FocusOut>", lambda e: e.widget is root and root.destroy())
+    root.bind("<FocusOut>", lambda e: e.widget is root and close())
     if callable(anchor):
         anchor = anchor()
     if anchor:
@@ -150,10 +160,30 @@ def show_menu(letter, anchor=None):
         x = min(max(ax - pad - tile_w // 2, left), right - width)
         root.geometry(f"+{x}+{y}")
     root.deiconify()
-    root.after(10, lambda: _force_foreground(root))
-    root.after(15000, root.destroy)  # nunca fica preso na tela se não ganhar o foco
+    timers = [root.after(10, lambda: state["open"] and _force_foreground(root)),
+              root.after(15000, close)]  # nunca fica preso na tela se não ganhar o foco
     root.mainloop()
+    for timer in timers:
+        root.after_cancel(timer)
+    root.destroy()
     return result
+
+
+_TK_ROOT = None
+
+
+def _popup_window():
+    """Janela do menu. No Windows o processo é residente: um Tk oculto é criado uma vez e
+    cada menu é um Toplevel dele (criar e destruir um Tk() por menu também destrói e recria
+    o interpretador Tcl a cada uso). No Linux cada menu é um processo, então é o próprio Tk.
+    O Tk capitaliza a classe: WM_CLASS vira "Accent-menu", que é o que a regra do KWin casa."""
+    global _TK_ROOT
+    if sys.platform != "win32":
+        return tk.Tk(className="accent-menu")
+    if _TK_ROOT is None:
+        _TK_ROOT = tk.Tk(className="accent-menu")
+        _TK_ROOT.withdraw()
+    return tk.Toplevel(_TK_ROOT)
 
 
 def _force_foreground(root):
@@ -753,12 +783,18 @@ def run_windows():
     threading.Thread(target=_windows_hook, args=(pressed,), daemon=True).start()
     while True:
         letter = pressed.get()
-        previous = user32.GetForegroundWindow()
-        choice = show_menu(letter, anchor=_caret_pos_windows(previous))
-        if choice:
-            user32.SetForegroundWindow(previous)
-            time.sleep(0.05)
-            _send_unicode(choice)
+        try:
+            previous = user32.GetForegroundWindow()
+            choice = show_menu(letter, anchor=_caret_pos_windows(previous))
+            if choice:
+                user32.SetForegroundWindow(previous)
+                time.sleep(0.05)
+                _send_unicode(choice)
+        except Exception:  # um menu com erro não pode derrubar o processo (pythonw é mudo)
+            import traceback
+            log = os.path.join(os.environ.get("LOCALAPPDATA", "."), "accent-menu.log")
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + traceback.format_exc() + "\n")
 
 
 def _windows_hook(pressed):
