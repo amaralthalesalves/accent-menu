@@ -1,6 +1,6 @@
 # special-chars-menu
 
-A tiny accent picker with a global hotkey. Press `Ctrl+Alt+E` and a small popup
+Having a 65% keyboard kinda sucks if you are a brazilian, because accent marks are very hard to use in them and the default solution from kde-keyboard has many flaws. So I created this solution: a tiny accent picker with a global hotkey. Press `Ctrl+Alt+E` and a small popup. It also works in Windows, which I didn't find a good solution to.
 opens next to the text caret with the accented forms of **e**:
 
 ```
